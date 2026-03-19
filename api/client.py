@@ -1,14 +1,30 @@
+"""
+OrangeHRM API client.
+
+Authentication note
+-------------------
+OrangeHRM is a Vue.js SPA — the login form (including its CSRF token) is
+rendered by JavaScript, so the token is NOT available in the raw HTML
+returned by a plain requests.get().
+
+The reliable solution is to perform the login through a real browser
+(Playwright), then extract the resulting session cookie and inject it into
+the requests Session.  This approach requires no CSRF token handling and
+works regardless of framework internals.
+"""
+
 import logging
-import re
 
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
 
 class OrangeHRMApiClient:
-    """Reusable HTTP client for OrangeHRM API using session-based auth."""
+    """Reusable HTTP client for the OrangeHRM REST API."""
+
+    CANDIDATES_URL = "/web/index.php/api/v2/recruitment/candidates"
 
     def __init__(self, base_url: str, username: str, password: str):
         self.base_url = base_url
@@ -17,40 +33,43 @@ class OrangeHRMApiClient:
         self._authenticate(username, password)
 
     # ------------------------------------------------------------------
-    # Auth
+    # Authentication
     # ------------------------------------------------------------------
 
     def _authenticate(self, username: str, password: str) -> None:
-        """Login via the web form to obtain a session cookie."""
-        login_url = f"{self.base_url}/web/index.php/auth/login"
-        validate_url = f"{self.base_url}/web/index.php/auth/validate"
+        """
+        Login via a headless Playwright browser, then transfer the
+        resulting session cookie into the requests Session.
 
-        # Step 1: GET login page to extract CSRF token
-        response = self.session.get(login_url)
-        response.raise_for_status()
+        Why Playwright?  OrangeHRM renders its login form (including the
+        CSRF _token input) with JavaScript, so a plain requests.get()
+        returns an empty HTML shell with no token to extract.
+        """
+        logger.info("Authenticating via headless browser (SPA login)...")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
 
-        token = self._extract_csrf_token(response.text)
-        logger.info("Extracted CSRF token for login")
+            page.goto(f"{self.base_url}/web/index.php/auth/login")
+            page.get_by_placeholder("Username").fill(username)
+            page.get_by_placeholder("Password").fill(password)
+            page.get_by_role("button", name="Login").click()
+            page.wait_for_selector(".oxd-main-menu", timeout=15_000)
 
-        # Step 2: POST credentials
-        payload = {"username": username, "password": password, "_token": token}
-        response = self.session.post(validate_url, data=payload, allow_redirects=True)
-        response.raise_for_status()
-
-        if "dashboard" not in response.url:
-            raise RuntimeError("Authentication failed — check credentials")
+            # Transfer all browser cookies to the requests session
+            for cookie in context.cookies():
+                self.session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie["domain"].lstrip("."),
+                )
+            browser.close()
 
         logger.info("API client authenticated successfully")
 
-    def _extract_csrf_token(self, html: str) -> str:
-        soup = BeautifulSoup(html, "html.parser")
-        token_input = soup.find("input", {"name": "_token"})
-        if not token_input:
-            raise RuntimeError("CSRF token not found on login page")
-        return token_input["value"]
-
     # ------------------------------------------------------------------
-    # Candidates
+    # Candidates API
     # ------------------------------------------------------------------
 
     def add_candidate(
@@ -61,8 +80,13 @@ class OrangeHRMApiClient:
         middle_name: str = "",
         contact_number: str = "",
     ) -> dict:
-        """Add a candidate and return the created resource."""
-        url = f"{self.base_url}/web/index.php/api/v2/recruitment/candidates"
+        """
+        POST /api/v2/recruitment/candidates
+        Returns the created candidate dict with at least: id, firstName, lastName, email.
+
+        Note: the API rejects a 'notes' field (returns 422) — omit it.
+        """
+        url = f"{self.base_url}{self.CANDIDATES_URL}"
         payload = {
             "firstName": first_name,
             "middleName": middle_name,
@@ -71,26 +95,35 @@ class OrangeHRMApiClient:
             "contactNumber": contact_number,
             "keywords": "",
             "dateOfApplication": None,
-            "notes": "",
             "consentToKeepData": False,
         }
         response = self.session.post(url, json=payload)
         response.raise_for_status()
-        data = response.json()
-        logger.info(f"Candidate created: {data['data']['id']}")
-        return data["data"]
+        candidate = response.json()["data"]
+        logger.info(f"Candidate created — id={candidate['id']}, email={email}")
+        return candidate
 
     def delete_candidate(self, candidate_id: int) -> None:
-        """Delete a candidate by ID."""
-        url = f"{self.base_url}/web/index.php/api/v2/recruitment/candidates"
+        """
+        DELETE /api/v2/recruitment/candidates  body: {"ids": [id]}
+        """
+        url = f"{self.base_url}{self.CANDIDATES_URL}"
         response = self.session.delete(url, json={"ids": [candidate_id]})
         response.raise_for_status()
         logger.info(f"Candidate {candidate_id} deleted")
 
-    def get_candidates(self, limit: int = 50, offset: int = 0) -> list:
-        """Return a list of candidates."""
-        url = f"{self.base_url}/web/index.php/api/v2/recruitment/candidates"
-        params = {"limit": limit, "offset": offset, "sortField": "candidate.dateOfApplication", "sortOrder": "DESC"}
+    def get_candidates(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        """
+        GET /api/v2/recruitment/candidates
+        Returns list of candidate dicts.
+        """
+        url = f"{self.base_url}{self.CANDIDATES_URL}"
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "sortField": "candidate.dateOfApplication",
+            "sortOrder": "DESC",
+        }
         response = self.session.get(url, params=params)
         response.raise_for_status()
         return response.json()["data"]

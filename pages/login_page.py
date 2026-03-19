@@ -11,11 +11,6 @@ logger = logging.getLogger(__name__)
 class LoginPage(BasePage):
     URL = f"{BASE_URL}/web/index.php/auth/login"
 
-    # Selectors
-    USERNAME_INPUT = "input[name='username']"
-    PASSWORD_INPUT = "input[name='password']"
-    SUBMIT_BUTTON = "button[type='submit']"
-
     def __init__(self, page: Page):
         super().__init__(page)
 
@@ -24,8 +19,9 @@ class LoginPage(BasePage):
 
     def login(self, username: str, password: str) -> None:
         logger.info(f"Logging in as '{username}'")
-        self.page.locator(self.USERNAME_INPUT).fill(username)
-        self.page.locator(self.PASSWORD_INPUT).fill(password)
-        self.page.locator(self.SUBMIT_BUTTON).click()
-        self.page.wait_for_url("**/dashboard**", timeout=15_000)
+        self.page.get_by_placeholder("Username").fill(username)
+        self.page.get_by_placeholder("Password").fill(password)
+        self.page.get_by_role("button", name="Login").click()
+        # Wait for the left nav menu — only present after successful login
+        self.page.wait_for_selector(".oxd-main-menu", timeout=15_000)
         logger.info("Login successful")
